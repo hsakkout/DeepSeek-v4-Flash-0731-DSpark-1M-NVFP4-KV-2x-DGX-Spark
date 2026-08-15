@@ -53,16 +53,56 @@ if [ "$swap_delta_gb" -gt 1 ]; then
   log "MEMWARN swap grew +${swap_delta_gb}GiB since last tick (total ${SWAP_GB}GiB) — likely reclaim churn"
 fi
 
-# Escalation: streak on distress — below 5 GiB available, or sustained swap growth.
+# --- Memory pressure state machine ---
+# States: CLEAR -> ALERT (5 distress ticks) -> REMINDER (every 24h sustained) -> ALLCLEAR
+# Distress = MemAvailable < 5 GiB OR swap grew >1 GiB since last tick.
+# Logs: MEMWARN every tick while <6 GiB; ALERT/REMINDER/ALLCLEAR are state transitions only.
 WARN_STREAK_FILE="$STATE_DIR/memwarn_streak"
-if [ "$AVAIL_GB" -lt 5 ] || [ "$swap_delta_gb" -gt 1 ]; then
+MEM_STATE_FILE="$STATE_DIR/mem_alert_state"     # clear|alert
+MEM_ALERT_TS_FILE="$STATE_DIR/mem_alert_ts"      # epoch of first ALERT
+MEM_LAST_REMINDER_FILE="$STATE_DIR/mem_last_reminder"  # epoch of last reminder
+
+in_distress=0
+[ "$AVAIL_GB" -lt 5 ] && in_distress=1
+[ "$swap_delta_gb" -gt 1 ] && in_distress=1
+
+if [ "$in_distress" = "1" ]; then
   streak=$(( $(cat "$WARN_STREAK_FILE" 2>/dev/null || echo 0) + 1 ))
   echo "$streak" > "$WARN_STREAK_FILE"
+  mem_state=$(cat "$MEM_STATE_FILE" 2>/dev/null || echo clear)
+  alert_ts=$(cat "$MEM_ALERT_TS_FILE" 2>/dev/null || echo 0)
+
   if [ "$streak" -ge 5 ]; then
-    log "ALERT sustained memory pressure: ${streak} consecutive MEMWARN ticks (MemAvailable=${AVAIL_GB}GiB, swap=${SWAP_GB}GiB). Consider GPU_MEMORY_UTILIZATION 0.80->0.77."
+    if [ "$mem_state" = "clear" ]; then
+      # First transition into alert
+      now=$(date +%s)
+      echo alert > "$MEM_STATE_FILE"
+      echo "$now" > "$MEM_ALERT_TS_FILE"
+      echo "$now" > "$MEM_LAST_REMINDER_FILE"
+      log "ALERT memory pressure onset: MemAvailable=${AVAIL_GB}GiB swap=${SWAP_GB}GiB (streak=$streak)"
+    else
+      # Already in alert — check for 24h reminder
+      last_reminder=$(cat "$MEM_LAST_REMINDER_FILE" 2>/dev/null || echo 0)
+      now=$(date +%s)
+      hours_since=$(( (now - last_reminder) / 3600 ))
+      if [ "$hours_since" -ge 24 ]; then
+        echo "$now" > "$MEM_LAST_REMINDER_FILE"
+        elapsed_h=$(( (now - alert_ts) / 3600 ))
+        log "REMINDER memory pressure sustained ${elapsed_h}h: MemAvailable=${AVAIL_GB}GiB swap=${SWAP_GB}GiB"
+      fi
+    fi
   fi
 else
+  # Not in distress — reset streak; if we were in alert, emit ALLCLEAR
   echo 0 > "$WARN_STREAK_FILE"
+  mem_state=$(cat "$MEM_STATE_FILE" 2>/dev/null || echo clear)
+  if [ "$mem_state" = "alert" ]; then
+    alert_ts=$(cat "$MEM_ALERT_TS_FILE" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    elapsed_h=$(( (now - alert_ts) / 3600 ))
+    echo clear > "$MEM_STATE_FILE"
+    log "ALLCLEAR memory pressure resolved after ${elapsed_h}h. MemAvailable=${AVAIL_GB}GiB swap=${SWAP_GB}GiB"
+  fi
 fi
 
 # --- Should DS4 even be up? Only supervise when the unit is enabled ---

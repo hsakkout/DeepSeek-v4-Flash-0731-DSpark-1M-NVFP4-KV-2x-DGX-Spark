@@ -18,7 +18,7 @@ if [ "$size" -lt "$offset" ]; then offset=0; fi
 new=$(tail -c +$((offset+1)) "$LOG")
 echo "$size" > "$STATE"
 
-alerts=$(printf '%s\n' "$new" | grep ' ALERT ' || true)
+alerts=$(printf '%s\n' "$new" | grep -E ' ALERT | REMINDER | ALLCLEAR ' || true)
 [ -n "$alerts" ] || exit 0   # empty stdout = silent (no delivery)
 
 printf '⚠️ DS4 memory alert (promaxgb10-0874):\n\n%s\n' "$alerts"
