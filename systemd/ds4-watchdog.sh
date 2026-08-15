@@ -52,6 +52,19 @@ if [ "$swap_delta_gb" -gt 1 ]; then
   log "MEMWARN swap grew +${swap_delta_gb}GiB since last tick (total ${SWAP_GB}GiB) — likely reclaim churn"
 fi
 
+# Escalation: after 5 consecutive MEMWARN ticks emit an ALERT line (the Hermes
+# cron relays ALERT lines to Telegram, dedup'd by its own state file).
+WARN_STREAK_FILE="$STATE_DIR/memwarn_streak"
+if [ "$AVAIL_GB" -lt 8 ] || [ "$swap_delta_gb" -gt 1 ]; then
+  streak=$(( $(cat "$WARN_STREAK_FILE" 2>/dev/null || echo 0) + 1 ))
+  echo "$streak" > "$WARN_STREAK_FILE"
+  if [ "$streak" -ge 5 ]; then
+    log "ALERT sustained memory pressure: ${streak} consecutive MEMWARN ticks (MemAvailable=${AVAIL_GB}GiB, swap=${SWAP_GB}GiB). Consider GPU_MEMORY_UTILIZATION 0.80->0.77."
+  fi
+else
+  echo 0 > "$WARN_STREAK_FILE"
+fi
+
 # --- Should DS4 even be up? Only supervise when the unit is enabled ---
 if ! systemctl --user is-enabled "$UNIT" >/dev/null 2>&1; then
   # Not enabled = admin intentionally not supervising; clear failures, exit.
