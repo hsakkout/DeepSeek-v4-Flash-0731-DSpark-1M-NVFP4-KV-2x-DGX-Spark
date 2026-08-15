@@ -36,7 +36,7 @@ if systemctl --user is-active llama-server >/dev/null 2>&1; then
   systemctl --user stop llama-server >> "$LOG_FILE" 2>&1 || true
 fi
 
-# --- Memory pressure: warn-only tracking (DS4 nominally leaves ~5-8 GiB avail) ---
+# --- Memory pressure: warn-only tracking (available floor ~5-7 GiB w/ DS4) ---
 AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
 SWAP_USED_KB=$(awk '/SwapTotal/{t=$2}/SwapFree/{f=$2}END{print t-f}' /proc/meminfo)
 AVAIL_GB=$((AVAIL_KB/1048576)); SWAP_GB=$((SWAP_USED_KB/1048576))
@@ -45,17 +45,17 @@ swap_prev=$(cat "$SWAP_PREV_FILE" 2>/dev/null || echo "$SWAP_USED_KB")
 echo "$SWAP_USED_KB" > "$SWAP_PREV_FILE"
 swap_delta_gb=$(( (SWAP_USED_KB - swap_prev) / 1048576 ))
 
-if [ "$AVAIL_GB" -lt 8 ]; then
-  log "MEMWARN MemAvailable=${AVAIL_GB}GiB (<8) swap_used=${SWAP_GB}GiB — memory pressure near DS4 ceiling"
+# DS4 at 0.80 util leaves ~5-7 GiB available steady-state; warn below 6, alert below 5.
+if [ "$AVAIL_GB" -lt 6 ]; then
+  log "MEMWARN MemAvailable=${AVAIL_GB}GiB (<6) swap_used=${SWAP_GB}GiB — memory pressure near DS4 ceiling"
 fi
 if [ "$swap_delta_gb" -gt 1 ]; then
   log "MEMWARN swap grew +${swap_delta_gb}GiB since last tick (total ${SWAP_GB}GiB) — likely reclaim churn"
 fi
 
-# Escalation: after 5 consecutive MEMWARN ticks emit an ALERT line (the Hermes
-# cron relays ALERT lines to Telegram, dedup'd by its own state file).
+# Escalation: streak on distress — below 5 GiB available, or sustained swap growth.
 WARN_STREAK_FILE="$STATE_DIR/memwarn_streak"
-if [ "$AVAIL_GB" -lt 8 ] || [ "$swap_delta_gb" -gt 1 ]; then
+if [ "$AVAIL_GB" -lt 5 ] || [ "$swap_delta_gb" -gt 1 ]; then
   streak=$(( $(cat "$WARN_STREAK_FILE" 2>/dev/null || echo 0) + 1 ))
   echo "$streak" > "$WARN_STREAK_FILE"
   if [ "$streak" -ge 5 ]; then
