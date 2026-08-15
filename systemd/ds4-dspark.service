@@ -1,24 +1,33 @@
 [Unit]
 Description=DeepSeek V4 Flash DSpark TP=2 vLLM service (2x DGX Spark)
-Documentation=file:/home/sakkout/models/docs/deepseek-v4-flash-0731-dspark-plan.md
-After=docker.service network-online.target
-Requires=docker.service
+Documentation=file:/home/sakkout/ds4-0731-recipe/README.md
+After=default.target network-online.target
 Wants=network-online.target
+# Runs as a USER unit (systemctl --user) under sakkout with linger enabled —
+# same model as llama-server.service and hermes-gateway.service. docker is
+# accessed via the docker group, no sudo.
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-User=sakkout
-Group=sakkout
 WorkingDirectory=/home/sakkout/ds4-0731-recipe
-# Model + graph capture can take 9-15 min on first boot; allow generous startup.
+# Weights load + cuda graph capture + flashinfer autotune can take 10-15 min;
+# allow generous startup. Engine-ready timeout inside the containers is 3600s.
 TimeoutStartSec=1800
-TimeoutStopSec=120
+TimeoutStopSec=180
+# Memory guard: llama.cpp (legacy :8080) must not coexist with DS4 on the
+# same GB10 unified memory. Stop it if it's somehow running (user service,
+# no sudo needed). DS4 at 0.80 util needs ~96GiB; llama+DS4 caused today's
+# head crash-loop.
+ExecStartPre=/usr/bin/systemctl --user stop llama-server
+# Preflight before orchestrating (fast: cache ownership, GID, ports, images).
+ExecStartPre=/home/sakkout/ds4-0731-recipe/systemd/ds4-preflight-wrapper.sh
 ExecStart=/home/sakkout/ds4-0731-recipe/systemd/ds4-start-wrapper.sh
 ExecStop=/home/sakkout/ds4-0731-recipe/systemd/ds4-stop-wrapper.sh
-# Do NOT restart on failure automatically — a half-launched 2-node TP pair is
-# worse than a clean failure; recover manually.
+# Do NOT auto-restart: a half-launched 2-node TP pair is worse than a clean
+# failure. The watchdog timer (ds4-watchdog.timer) owns recovery decisions and
+# restarts the whole pair via this unit after consecutive health failures.
 Restart=no
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

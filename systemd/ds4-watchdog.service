@@ -1,0 +1,10 @@
+[Unit]
+Description=DS4 watchdog probe (one-shot; driven by ds4-watchdog.timer)
+
+[Service]
+Type=oneshot
+ExecStart=/home/sakkout/ds4-0731-recipe/systemd/ds4-watchdog.sh
+# A probe should never hang; restart (if triggered) takes over as its own
+# long-running operation via ds4-dspark.service.
+TimeoutStartSec=170
+Nice=10
