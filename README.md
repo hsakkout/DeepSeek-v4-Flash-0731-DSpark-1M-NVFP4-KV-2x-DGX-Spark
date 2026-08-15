@@ -11,6 +11,12 @@
 >   [Updating to the official 0731 release](#updating-to-the-official-deepseek-v4-flash-0731-release-2026-07-31)**
 > - **`fraserprice/DeepSeek-V4-Flash-DSpark`** (preview) — 84.3 tok/s peak. Everything in this
 >   README below the 0731 section was measured on this checkpoint and still stands.
+>
+> **Censored or uncensored — your choice, same recipe.** The stock DeepSeek weights are the
+> default. If you want the refusal-free build, Keys (drowzeys) publishes an abliterated 0731
+> that drops straight in: same image, same patches, same flags, same context. Only `--model`
+> changes. Access to it is gated and carries a Responsible Use Agreement.
+> **→ [Model choice: censored or uncensored](#model-choice-censored-or-uncensored)**
 
 ---
 
@@ -26,6 +32,60 @@ wrong place. It is not the weights and not a config regression: vLLM's DSpark dr
 silently drops twelve tensors, and 0731 is far more sensitive to the loss than the preview was.
 
 ### What to change
+
+## Patch 5 — stop strings must not fire inside the reasoning segment
+
+If you serve this model with a harness that sends `stop` sequences (lm-evaluation-harness
+sends `stop[:4]` on **every** request), you are almost certainly losing answers silently.
+
+vLLM's v1 detokenizer matches client stop strings against the whole output stream. With
+think-in-prompt templates, generation starts *inside* `<think>`, and chain-of-thought
+naturally restates phrases like `Question:`. The stop fires mid-reasoning, `</think>`
+never arrives, and the reasoning parser returns `content: null`. The request looks like a
+model failure; it is a serving-layer one. Hosted deployments of the same checkpoint are
+immune because they scope stops to content.
+
+Apply **[Patch 5](patches/0005-suppress-stops-in-reasoning.patch)** — bind-mount, no rebuild:
+
+```bash
+-v /path/to/patched/detokenizer.py:/opt/env/lib/python3.12/site-packages/vllm/v1/engine/detokenizer.py:ro
+```
+
+> **Both nodes.** `start-deepseek-v4-flash-dspark.sh` syncs the compose and env files to the
+> worker but **not** bind-mounted patch files. The file must exist at the same path on the
+> worker too, or it silently runs unpatched and you get confusing half-fixed results.
+
+Guard is per-request and needs no configuration: if the request's last prompt token is
+`<think>`, stop strings stay dormant until `</think>` appears. EOS and `max_tokens` are
+unaffected; non-thinking requests are untouched. Opt out with
+`VLLM_SUPPRESS_STOPS_IN_REASONING=0`.
+
+Measured on 2× DGX Spark (GB10), TP=2, k=5, `unsloth/DeepSeek-V4-Flash-0731`:
+
+| metric | before | after |
+|---|---|---|
+| decapitation reproducer (seed + stop) | 43 tok, `content: null` | 344 tok, correct answer |
+| stop honored on a non-thinking request | ✓ | ✓ (cuts at exact stop) |
+| GSM8K n=50, temp 0.6 / top_p 0.95 | 8–15 nulls, 0.66–0.84 | **1 null, 0.98** |
+
+The single residual null is mechanism (B) in [#18](../../issues/18) — a marginal-stability
+reasoning runaway, unrelated to stop strings. Patch 5 does not address it.
+
+## Patch 5 and issue #18 (B): the runaway becomes *more* visible, not less
+
+Worth stating so nobody reads it as a regression. Mechanism (B) is a reasoning runaway in
+which `</think>` never arrives. Because Patch 5 keeps stops dormant until the end marker
+appears, a request in that state now has stops dormant for its whole life and runs to
+`max_tokens` — where previously a client stop string could cut it short by accident.
+
+That is correct by design: a stop string was never meant to bound reasoning, and a run
+truncated by one was returning `content: null` anyway. But the practical effect is that
+(B) shows up as a full-budget request after this patch instead of a short one, so a fleet
+that applies Patch 5 may see *reported* token usage on those requests rise. The failure
+rate does not change; only how long each failure takes to admit it.
+
+If you are measuring (B), note that stop strings are no longer a confound in either
+direction, which is the point.
 
 Apply **[Patch 4](patches/0004-dspark-shared-expert-gate-up-proj.patch)** on top of your existing
 setup. Two lines, no rebuild — bind-mount it read-only:
@@ -93,13 +153,29 @@ therefore measures **steps/s, not tokens/s**, and under-reports by the acceptanc
 vs 60.1 tok/s on the identical request. Read `usage.completion_tokens`, or divide server-side
 `vllm:generation_tokens_total` by wall time.
 
-**`k` is still 5.** `dspark_block_size = 5` in the 0731 checkpoint exactly as in the preview.
-DeepSeek's 0731 model card recommends `num_speculative_tokens: 7`; that does not work here. The
-boot-time divisibility guard can be patched out, but the run then fails on first generation
-because the drafter emits exactly `dspark_block_size` tokens per pass and multi-block drafting is
-not implemented — the same reason `k=10` boots and then crashes. `k=7` is fine on drafters that
-are natively deeper (MiMo-V2.5 DFlash, GLM-5.2's DSpark speculator, Inkling); DeepSeek-V4-Flash is
-not one of them.
+**`k` is still 5 on this runtime — and that is a property of the runtime, not the checkpoint.**
+`dspark_block_size = 5` in the 0731 checkpoint exactly as in the preview, and DeepSeek's model
+card recommends `num_speculative_tokens: 7`.
+
+On **this recipe's image** (vLLM `0.21.1rc1.dev339+g1967a5627bc3` + B12X), k=7 does not work.
+`SpeculativeConfig.hf_config_override` has a DSpark branch that sets `n_predict =
+dspark_block_size = 5`, so the divisibility guard rejects it at boot. Patch that guard out and the
+run crashes on the first generation with `The size of tensor a (7) must match the size of tensor b
+(5)` — the draft model hardcodes its block width to `dspark_block_size`, so `propose()` returns 5
+columns however large `k` is. `k=10` fails the same way. The accurate rule **on this image** is
+`k <= 5`, or a multiple of 5.
+
+On the **anemll 0.25.2 lineage** (`ghcr.io/anemll/dspark-vllm-gx10:0.1.1`, vLLM
+`0.25.2.dev0+g752a3a504`) neither failure occurs. That build has no DSpark branch in
+`hf_config_override`, so `n_predict` resolves to `num_nextn_predict_layers` = **1** and the guard
+is inert; and its `DSparkSpeculator` sizes the draft block from `num_speculative_tokens` rather
+than `dspark_block_size`, so a 7-wide draft is simply a wider single block. k=7 boots and
+generates there — confirmed by @robotnurse in #22 with per-position acceptance for positions 0-6.
+Corollary on that image: omit `num_speculative_tokens` and you get k=1, not k=5.
+
+Deeper drafts are still not the missing speed on either runtime: positions 4-5 accept at
+0.078/0.047 on hard content here, and #22 measured k=5 → k=7 buying +3.3% tokens/step for a 33%
+wider verify batch.
 
 ### Ruled out by measurement, so you don't repeat it
 
@@ -240,6 +316,55 @@ Keep these `.env.dspark` values unless you are deliberately experimenting:
   verifies every safetensor shard is present, and mirrors the download to the
   worker node.
 
+### Model choice: censored or uncensored
+
+Two checkpoints, one recipe. **Nothing in the launch flow changes between them** — same
+image, same patches, same `k=5`, same `nvfp4_ds_mla` KV cache, same 1M context, same
+`gpu-memory-utilization`. You point `--model` at whichever directory you downloaded.
+
+| | Censored (default) | Uncensored (abliterated) |
+|---|---|---|
+| HF repo | [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | [`drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32`](https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32) |
+| Author | DeepSeek-AI | **Keys** (`drowzeys`) |
+| Base | — | 0731 GA @ `9e165c30` |
+| Access | open | **gated** — access request + Responsible Use Agreement |
+| Safety refusals | stock | removed (reported 32/32 bypass on a hard refusal suite) |
+| DSpark MTP draft modules | stock | **stock, unedited** |
+| Patch 4 | required | required |
+| Patch 5 | recommended (any stop-sending harness) | recommended |
+| On-disk | ~156 GB | ~156 GB |
+
+**Getting the uncensored weights:**
+
+```bash
+hf download drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32 \
+  --local-dir /var/tmp/models/ds4-0731-abliterated
+```
+
+That download will 403 until you have been granted access. Request it on the model page
+and accept the Responsible Use Agreement first. In short: 18 or older; no sexual
+exploitation or endangerment of minors; no self-harm or suicide-promotion content; no
+harassment, doxxing, or fraud; nothing illegal in your jurisdiction; you are accountable
+for what you prompt it to produce; and the upstream DeepSeek license still applies.
+**Read the terms on the model card itself, not this summary — that page is authoritative.**
+You are the one supplying the guardrails a refusal-trained model would have supplied, so
+plan your filtering, review, and access control before you put it in front of anything.
+
+**What the abliteration actually does.** A single refusal direction is projected out of 33
+`attn.wo_b` tensors across layers 10–42 (λ = 3.5, k = 1, mean relative Frobenius delta
+≈ 0.056). The `float8_e8m0fnu` scales are preserved. **The DSpark MTP draft modules are
+deliberately left untouched**, which is the part that matters for this recipe: the draft
+stages are exactly what [Patch 4](#updating-to-the-official-deepseek-v4-flash-0731-release-2026-07-31)
+repairs and what your acceptance rate rides on. Edited draft weights would land you back in
+that same class of problem.
+
+**What we run.** Our lane 1 serves the abliterated weights on this exact recipe with no
+config changes. We have **not** run a controlled censored-vs-uncensored throughput A/B, so
+read every benchmark number in this README as measured on the stock weights. The edit
+touches 33 attention output projections and leaves the draft stages alone, so there is no
+mechanism we are aware of that would move decode speed — but that is reasoning, not a
+measurement, and we are not going to present it as one.
+
 ### Image / build
 
 - `./build-dspark-vllm-runtime.sh` builds the base DSpark overlay
@@ -331,6 +456,79 @@ Capture runtime evidence before and after any fix:
 scripts/capture_runtime.sh runtime-before-change
 scripts/capture_runtime.sh runtime-after-change
 ```
+
+## Reasoning / thinking mode
+
+Reasoning is **off by default** in this recipe (`--default-chat-template-kwargs '{"thinking":false}'`).
+Everything below was measured on this stack; several of these have cost people real time.
+
+**The response field is `reasoning`, not `reasoning_content`.**
+Non-streaming: `choices[0].message.reasoning`. Streaming: `choices[0].delta.reasoning`.
+There is **no** `reasoning_content` key in a response on this runtime — it is deprecated and only
+accepted on *input*. Clients reading `reasoning_content` see empty and conclude reasoning
+extraction is broken. Credit @vinicius-symetrix (PR #13) for independently reporting the
+streaming half of this.
+
+**`<think>` is written into the prompt, not generated.**
+
+```
+thinking off →  ...<｜Assistant｜></think>
+thinking on  →  ...<｜Assistant｜><think>
+```
+
+So in thinking mode the model's output *starts* with reasoning text and ends with `</think>`;
+there is no opening tag in the completion. **A missing `<think>` in the output is correct
+behaviour.** If you see `</think>` inside `content`, your server is missing
+`--reasoning-parser deepseek_v4` and `--reasoning-config`.
+
+**Enabling it.** Per request: `chat_template_kwargs: {"thinking": true}`, or a top-level
+`reasoning_effort` of `low`/`high`/`max`. Server-wide:
+`--default-chat-template-kwargs '{"thinking":true}'`.
+
+**Never send `reasoning_effort: "none"` together with `thinking: true`.** `"none"` forces
+chat-mode formatting while the reasoning parser stays armed for thinking; with no `</think>`
+in the output the parser puts the *entire* response into `reasoning` and returns
+`content: null`. Measured 4/4 — real `completion_tokens`, `finish_reason: stop`, empty content.
+`reasoning_effort` on its own is fine.
+
+**`reasoning_effort: "low"`, `"medium"` and `"high"` all produce *no* effort prefix.** They
+normalise to an internal `"high"` that has no injection branch, so nothing is added to the
+prompt. Only `"max"`/`"xhigh"` inject — and what they inject is the model's **high** text
+(79 tokens), not its `max` text (96). **The model's `max` effort is unreachable on this
+tokenizer mode**, and anyone selecting `"high"` here is running at the vendor's *low*.
+
+An earlier revision of this section said `"low"` behaves as `"high"`. That was true of the
+runtime's internal variable and **inverted as advice** — corrected after @Capicua25x measured
+it (issue #25). Verify in three requests; `prompt_tokens` is the whole witness:
+
+```bash
+for E in low high max; do
+  printf '%-5s ' "$E"
+  curl -s http://127.0.0.1:8888/v1/chat/completions -H 'Content-Type: application/json' \
+    -d "{\"model\":\"deepseek-v4-flash-dspark\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],
+         \"max_tokens\":1,\"reasoning_effort\":\"$E\"}" \
+  | python3 -c 'import json,sys; print("prompt_tokens =", json.load(sys.stdin)["usage"]["prompt_tokens"])'
+done
+# this stack:  low 5 | high 5 (identical — no prefix) | max 84 (+79)
+# api.deepseek.com, same messages: low 681 | high 760 (+79) | max 773
+```
+
+PR #24 vendors the checkpoint's own three-level table and restores the distinction. **Note the
+behaviour change when it lands:** `reasoning_effort:"max"` will then inject DeepSeek's real max
+text instead of its high text, so existing callers of `"max"` get a materially stronger
+instruction. `"low"` and omitted stay byte-identical.
+
+**With `--tokenizer-mode deepseek_v4`, a `chat_template.jinja` in the model directory is
+ignored** — prompt formatting comes from the checkpoint's built-in encoder, not a Jinja
+template. This is why the HuggingFace discussion #26 workaround has no effect here. It is
+stronger than that: **explicitly passing `--chat-template /path/to/chat_template.jinja` is also
+ignored** — it shows up in the engine's `non-default args` and changes nothing (measured in
+#25). There is no way to reach the template's three-way effort split without leaving
+`tokenizer_mode=deepseek_v4`, which this recipe needs for DSpark.
+
+**Thinking mode needs output budget.** Reasoning consumes `max_tokens` before any content is
+produced, so a small cap yields `finish_reason: length` with empty `content`. If you benchmark
+thinking mode at a low cap you will measure truncation, not the model.
 
 ## Benchmarks
 
@@ -795,23 +993,28 @@ Core vLLM flags:
 - `--max-model-len 1048576`
 - `--max-num-seqs 6`
 - `--max-num-batched-tokens 8192`
-- `--max-cudagraph-capture-size 6` (must equal `--max-num-seqs`)
+- `--max-cudagraph-capture-size 36` (derived: `max-num-seqs × (num_speculative_tokens + 1)` = 6 × 6)
 - `--gpu-memory-utilization 0.80`
 - `--enable-prefix-caching`
 - `--async-scheduling`
 - `--enable-chunked-prefill`
 - `--generation-config vllm` (no `--override-generation-config`)
-- `--speculative-config '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'`
-  - **This 1M / `max-num-seqs 6` profile MUST use `num_speculative_tokens: 3`.** Spec-decode requires the
-    cudagraph capture sizes to be a multiple of `num_speculative_tokens + 1`. At `max-num-seqs 6` vLLM's
-    ladder is `[1,2,4]`: spec 3 → multiple of **4** (the `4` satisfies it ✓); **spec 5 → multiple of 6,
-    which `[1,2,4]` cannot satisfy → `No valid cudagraph sizes` and engine init FAILS.** (Verified 2026-07-04.)
-  - **`num_speculative_tokens: 5` is faster but requires `max-num-seqs` to be a multiple of 6** (e.g. 12) so
-    the ladder yields a valid captured size. That's the lower-context / higher-concurrency lane — see
-    [`DEFAULT-CONFIG.md`](DEFAULT-CONFIG.md) (350K ctx, seqs 12, spec 5), benchmarked **~49 tok/s mixed /
-    54–60 structured / ~75 best-case**; spec 3 ≈ 40 avg. At full 1M the seqs-12 KV won't fit on 2 Sparks,
-    so **1M pairs with seqs 6 + spec 3**; the seqs-12 + spec-5 lane pairs with a shorter context.
+- `--speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'`
+  - **Use `num_speculative_tokens: 5` on this 1M / `max-num-seqs 6` profile.** It is worth roughly **+24%**
+    over `k=3`. See [`DEFAULT-CONFIG.md`](DEFAULT-CONFIG.md) and
+    [`SPEED-UPDATE-2026-07-29.md`](SPEED-UPDATE-2026-07-29.md) (83.4 tok/s peak, 74.1 mean).
+  - Set `--max-cudagraph-capture-size` explicitly to `max-num-seqs × (k + 1)` = **36**. The shipped
+    `docker-compose.dspark.yml` derives this for you.
   - Keep `draft_sample_method:probabilistic` — it beats greedy for DSpark's calibrated draft heads.
+
+  > ⚠️ **Corrected 2026-08-05.** This section previously stated that the 1M / seqs-6 profile **MUST** use
+  > `num_speculative_tokens: 3`, and that `k=5` would fail engine init with `No valid cudagraph sizes`
+  > (verified 2026-07-04). **That is no longer true and the reasoning was incomplete.** The original claim
+  > assumed `--max-cudagraph-capture-size` was pinned to `max-num-seqs` (6), leaving vLLM's `[1,2,4]` ladder
+  > with nothing divisible by `k+1 = 6`. The fix is not to lower `k` — it is to set the capture size to
+  > `seqs × (k+1) = 36`, which is what the compose file now does. `k=3` still boots, it is just the slow
+  > path. Anyone who benchmarked this repo from the README before this date was measuring `k=3`; re-run
+  > with `k=5` before publishing numbers anywhere.
 
 Key runtime env:
 
@@ -926,6 +1129,67 @@ Check ownership before blaming the recipe:
 ls -ld "${HF_CACHE:-$HOME/.cache/huggingface}"
 ```
 
+### Empty `content` with real `completion_tokens` — classify before you report
+
+A bare "null-content rate" now aggregates at least five unrelated causes, and they want
+different fixes. Two fields settle which one you have. Do this before opening an issue or
+quoting a rate:
+
+| `finish_reason` | `</think>` in the raw output | what it is |
+| --- | --- | --- |
+| `stop` | no | a **client stop string fired inside reasoning** — the CoT restated it, generation was decapitated before `</think>`. lm-eval sends `stop[:4]` on every request. Fix: PR #21's reasoning-aware stop guard, or `until: []` client-side. |
+| `length` | no | **budget exceeded**, not a hang. Reasoning is heavy-tailed even on trivial prompts (48–440 tokens measured on `"What's 1 + 1?"`). Raise `max_tokens` and re-measure; if the rate moves with the budget it was never a non-termination. |
+| `length` | no, *and* the rate does not move with budget | **genuine non-termination** — a repetition loop. Detector that works: 3 consecutive 4,000-char windows below 2% novel word-8-grams. Block-level uniqueness reads *high* on plainly looping text; do not use it. Tracked in issue #18 (B). Sampling at the checkpoint's specified `temperature 1.0` measured 18/18 terminating vs 14/36 at 0.6. |
+| `stop` | n/a | you sent **`reasoning_effort:"none"` with `thinking:true`** — chat-mode prompt, thinking-armed parser. See above in *Reasoning / thinking mode*. |
+| `stop` | yes, and the answer is missing at the client only | the client is reading **`reasoning_content`**; the response key is **`reasoning`**. |
+
+A sixth, rarer one: the model occasionally emits a pseudo-tag scaffold
+(`<STORE_AND_RETURN> 570 </STORE_AND_RETURN>`, `<STDERR> final</STDERR>630`) as its *entire*
+output and never closes `</think>`, so the parser files everything as reasoning. Measured
+5/60 → 0/60 with a marker-specific fallback, ~0.8% residual on a different tag; tag-matching is
+whack-a-mole, so this is documented rather than patched. Non-streaming only in the reported
+measurements. Credit @robotnurse (issue #6).
+
+Classifying costs nothing and it is what made issue #18 tractable.
+
+### Sharing the HF cache over NFS between the nodes — seven JIT caches, three failures
+
+**Symptom.** Any of, usually in this order as you fix each one:
+
+* `torch.compile` dies at startup with a `FileExistsError` / `makedirs` race
+* DeepGEMM asserts `runtime != nullptr` — stale or half-written cubins read over NFS
+* the head's first engine attempt dies every boot on an **ABI-mismatched FlashInfer
+  `sampling.so`**, compiled by one node and silently loaded by the other. Silent because this
+  stack runs `FLASHINFER_DISABLE_VERSION_CHECK=1`. With the worker entrypoint not retrying
+  after a process death, this also orphans the worker on each boot.
+
+None of those messages mention the cache. They read like broken kernels or a broken build.
+
+**Cause.** Downloading the 167 GB checkpoint once and serving it to both nodes over NFS is the
+obvious move — but seven JIT/workspace caches default to (or historically sat under) the same
+tree, and then **both ranks JIT into the same directories concurrently**.
+
+**Fix.** `docker-compose.dspark.yml` now mounts a **separate, node-local** volume at
+`/vllm-cache` and points all seven at it, independent of where `HF_CACHE` lives:
+
+| variable | value |
+| --- | --- |
+| `VLLM_CACHE_ROOT` | `/vllm-cache` |
+| `DG_JIT_CACHE_DIR` | `/vllm-cache/deepgemm-cache` |
+| `FLASHINFER_WORKSPACE_BASE` | `/vllm-cache/flashinfer` |
+| `TILELANG_CACHE_DIR` | `/vllm-cache/tilelang` |
+| `TORCHINDUCTOR_CACHE_DIR` | `/vllm-cache/torchinductor-cache` |
+| `TRITON_CACHE_DIR` | `/vllm-cache/triton-cache` |
+| `TORCH_EXTENSIONS_DIR` | `/vllm-cache/torch_extensions` |
+
+The host path is `JIT_CACHE_DIR` (default `${HOME}/.cache/vllm-dspark`) — **keep it on local
+disk on every node**. If you already ran with a shared cache, purge the poisoned directories
+once; a stale `sampling.so` survives the config change.
+
+Credit [@antoniohlc](https://github.com/antoniohlc), issue #27, who found the whole set one
+crash at a time and reproduced this repo's numbers (69.8–73.8 tok/s warm single-stream) once it
+was fixed. The **model weights** in `HF_CACHE` are fine on NFS; it is only the JIT tree that
+must be per-node.
 
 ### Garble fix (2026-07-03)
 

@@ -16,6 +16,12 @@ This **meets the 66-70 tok/s target** and beats the repo's documented 53-60 — 
 ## Config that produced it
 
 - **Image:** `vllm-dspark-runtime:mia-raf-pr1-nvfp4-probe-c-keys-concurrency-p2b`
+  ⚠️ **This is a LOCAL-ONLY tag. It is not published to any registry and you cannot pull it.**
+  It should not have appeared in a public doc unmarked (see [#12](../../issues/12)).
+  To reproduce this runtime without building it yourself, use the
+  [`sparkrun/`](sparkrun/) recipe, which pins a public base image by digest and rebuilds the
+  stage-c overlay in-container. For a one-pull prebuilt alternative see
+  [`RUNTIME-BAKEOFF-2026-07-29.md`](RUNTIME-BAKEOFF-2026-07-29.md).
 - **Model:** `fraserprice/DeepSeek-V4-Flash-DSpark` (local, `/cache/huggingface/fraserprice/DeepSeek-V4-Flash-DSpark`)
 - **TP2** across Bluey (192.168.192.1) + Reddie (192.168.192.2), `--distributed-executor-backend mp`
 - **KV:** `nvfp4_ds_mla`, `--block-size 256`, `--max-model-len 1048576` → **1,243,449-token** KV pool

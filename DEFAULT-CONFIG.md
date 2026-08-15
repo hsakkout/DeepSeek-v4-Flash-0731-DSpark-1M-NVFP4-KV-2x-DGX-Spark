@@ -23,9 +23,16 @@
 >    `DeepSeek-V4-Flash-0731`; substitute your 0731 weights path. Everything else in the ⭐ block
 >    still matches what is served today except that the live server also passes
 >    `--reasoning-config` and `--enable-flashinfer-autotune`.
+> 5. **Censored or uncensored is just the `--model` path.** Every flag on this page is
+>    identical for the stock `deepseek-ai/DeepSeek-V4-Flash-0731` weights and for Keys'
+>    abliterated build (`drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32`,
+>    gated, Responsible Use terms apply). Same image, same patches, same `k=5`, same
+>    `nvfp4_ds_mla`, same context. See
+>    [Model choice: censored or uncensored](README.md#model-choice-censored-or-uncensored).
 >
 > Throughput and acceptance figures on this page were measured on the **preview** checkpoint with the
-> **stock (buggy) loader**.
+> **stock (buggy) loader**, and on the **stock (censored)** weights — there is no
+> censored-vs-uncensored A/B behind these numbers.
 
 
 This is the **canonical, verified-working config** — captured live from the running
