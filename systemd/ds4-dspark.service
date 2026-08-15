@@ -1,0 +1,24 @@
+[Unit]
+Description=DeepSeek V4 Flash DSpark TP=2 vLLM service (2x DGX Spark)
+Documentation=file:/home/sakkout/models/docs/deepseek-v4-flash-0731-dspark-plan.md
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=sakkout
+Group=sakkout
+WorkingDirectory=/home/sakkout/ds4-0731-recipe
+# Model + graph capture can take 9-15 min on first boot; allow generous startup.
+TimeoutStartSec=1800
+TimeoutStopSec=120
+ExecStart=/home/sakkout/ds4-0731-recipe/systemd/ds4-start-wrapper.sh
+ExecStop=/home/sakkout/ds4-0731-recipe/systemd/ds4-stop-wrapper.sh
+# Do NOT restart on failure automatically — a half-launched 2-node TP pair is
+# worse than a clean failure; recover manually.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -9,3 +9,4 @@ __pycache__/
 *.log
 vllm-cache/
 /models/
+venv_check/
