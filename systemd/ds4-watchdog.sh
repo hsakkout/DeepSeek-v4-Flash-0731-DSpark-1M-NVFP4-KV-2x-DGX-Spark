@@ -36,6 +36,22 @@ if systemctl --user is-active llama-server >/dev/null 2>&1; then
   systemctl --user stop llama-server >> "$LOG_FILE" 2>&1 || true
 fi
 
+# --- Memory pressure: warn-only tracking (DS4 nominally leaves ~5-8 GiB avail) ---
+AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+SWAP_USED_KB=$(awk '/SwapTotal/{t=$2}/SwapFree/{f=$2}END{print t-f}' /proc/meminfo)
+AVAIL_GB=$((AVAIL_KB/1048576)); SWAP_GB=$((SWAP_USED_KB/1048576))
+SWAP_PREV_FILE="$STATE_DIR/swap_kb_prev"
+swap_prev=$(cat "$SWAP_PREV_FILE" 2>/dev/null || echo "$SWAP_USED_KB")
+echo "$SWAP_USED_KB" > "$SWAP_PREV_FILE"
+swap_delta_gb=$(( (SWAP_USED_KB - swap_prev) / 1048576 ))
+
+if [ "$AVAIL_GB" -lt 8 ]; then
+  log "MEMWARN MemAvailable=${AVAIL_GB}GiB (<8) swap_used=${SWAP_GB}GiB — memory pressure near DS4 ceiling"
+fi
+if [ "$swap_delta_gb" -gt 1 ]; then
+  log "MEMWARN swap grew +${swap_delta_gb}GiB since last tick (total ${SWAP_GB}GiB) — likely reclaim churn"
+fi
+
 # --- Should DS4 even be up? Only supervise when the unit is enabled ---
 if ! systemctl --user is-enabled "$UNIT" >/dev/null 2>&1; then
   # Not enabled = admin intentionally not supervising; clear failures, exit.
