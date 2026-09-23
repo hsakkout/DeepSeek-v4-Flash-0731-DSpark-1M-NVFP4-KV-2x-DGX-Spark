@@ -25,12 +25,27 @@ docker info >/dev/null 2>&1 && ok "docker no-sudo works (head)" || bad "docker r
 ssh -o ConnectTimeout=8 -o BatchMode=yes "$WORKER" "docker compose version" >/dev/null 2>&1 && ok "docker compose present (worker)" || bad "docker compose missing (worker)"
 ssh -o ConnectTimeout=8 -o BatchMode=yes "$WORKER" "docker info" >/dev/null 2>&1 && ok "docker no-sudo works (worker)" || bad "docker requires sudo (worker)"
 
-# --- RDMA GID index 3 valid on all 4 devices (both nodes) ---
+# --- RDMA: a valid RoCEv2 GID must exist on all 4 devices (both nodes) ---
+# The GID index is NOT stable across reboots/driver reloads: the table can
+# shift (e.g. RoCEv2 moved 3->4 on spark-8485 after an Aug-2026 driver event).
+# So probe each device for the lowest index whose type is "RoCE v2" and a
+# non-zero GID, instead of hard-coding index 3.
 for host in self "$WORKER"; do
-  cmd='for d in rocep1s0f0 rocep1s0f1 roceP2p1s0f0 roceP2p1s0f1; do t=$(cat /sys/class/infiniband/$d/ports/1/gid_attrs/types/3 2>/dev/null); [ "$t" = "RoCE v2" ] && echo "ok $d" || echo "bad $d"; done'
+  cmd='for d in rocep1s0f0 rocep1s0f1 roceP2p1s0f0 roceP2p1s0f1; do
+    found=""
+    for i in 0 1 2 3 4 5 6 7; do
+      t=$(cat /sys/class/infiniband/$d/ports/1/gid_attrs/types/$i 2>/dev/null)
+      g=$(cat /sys/class/infiniband/$d/ports/1/gids/$i 2>/dev/null)
+      # want global (IPv6-mapped) RoCEv2 GIDs, not fe80 link-local ones
+      case "$g" in fe80*|"") continue ;; esac
+      if [ "$t" = "RoCE v2" ]; then found=$i; break; fi
+    done
+    if [ -n "$found" ]; then echo "ok $d gid$found"; else echo "bad $d"; fi
+  done'
   if [ "$host" = self ]; then out=$(bash -c "$cmd"); else out=$(ssh -o ConnectTimeout=8 -o BatchMode=yes "$host" "$cmd" 2>/dev/null); fi
   good=$(echo "$out" | grep -c '^ok' || true); total=$(echo "$out" | grep -c '^' || true)
-  if [ "$good" = "4" ]; then ok "GID3 RoCEv2 valid 4/4 ($host)"; else bad "GID3 RoCEv2 only $good/4 valid ($host): $out"; fi
+  if [ "$good" = "4" ]; then ok "RoCEv2 GID present 4/4 ($host): $(echo "$out" | awk '{printf "%s:%s ", $2, $3}' | tr -d '\n')"
+  else bad "RoCEv2 GID missing on $((4-good)) device(s) ($host): $out"; fi
 done
 
 # --- Interfaces UP (both nodes) ---
