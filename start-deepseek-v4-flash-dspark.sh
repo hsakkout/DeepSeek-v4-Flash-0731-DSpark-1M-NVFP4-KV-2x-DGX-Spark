@@ -62,13 +62,44 @@ WORKER_HF_CACHE="${WORKER_HF_CACHE:-${HF_CACHE:-}}"
 REMOTE_WORKER_DIR="$(printf '%q' "$WORKER_DIR")"
 REMOTE_COMPOSE="cd $REMOTE_WORKER_DIR && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1"
 
+# --- Probe the live RoCEv2 GID index per node (kernel/driver updates move it) ---
+# NCCL_IB_GID_INDEX is a table offset, not a stable property: the RoCEv2 entry
+# can land on gid3 or gid4 after driver reloads or kernel updates (observed
+# both directions on spark-8485). Probe each node's table at launch and pass
+# the actual index; explicit env (WORKER_NCCL_IB_GID_INDEX / NCCL_IB_GID_INDEX
+# in .env.dspark) still wins if set.
+probe_gid() { # $1 = host (self|ssh target)
+  local script='found=""; for d in rocep1s0f0 rocep1s0f1 roceP2p1s0f0 roceP2p1s0f1; do
+    for i in 0 1 2 3 4 5 6 7; do
+      t=$(cat /sys/class/infiniband/$d/ports/1/gid_attrs/types/$i 2>/dev/null)
+      g=$(cat /sys/class/infiniband/$d/ports/1/gids/$i 2>/dev/null)
+      case "$g" in fe80*|"") continue ;; esac
+      if [ "$t" = "RoCE v2" ]; then found=$i; break 2; fi
+    done
+  done; echo "$found"'
+  if [ "$1" = "self" ]; then bash -c "$script"; else ssh -o ConnectTimeout=8 -o BatchMode=yes "$1" "$script" 2>/dev/null; fi
+}
+
+HEAD_GID="${NCCL_IB_GID_INDEX:-}"
+if [ -z "$HEAD_GID" ]; then
+  HEAD_GID="$(probe_gid self)"
+  if [ -n "$HEAD_GID" ]; then echo "Probed head RoCEv2 GID index: $HEAD_GID"; else echo "WARN: no RoCEv2 GID found on head — leaving NCCL_IB_GID_INDEX unset"; fi
+fi
+export NCCL_IB_GID_INDEX="$HEAD_GID"
+
+WORKER_GID="${WORKER_NCCL_IB_GID_INDEX:-}"
+if [ -z "$WORKER_GID" ]; then
+  WORKER_GID="$(probe_gid "$WORKER_HOST")"
+  [ -n "$WORKER_GID" ] && echo "Probed worker RoCEv2 GID index: $WORKER_GID"
+fi
+
 echo "Syncing DSpark deployment files to ${WORKER_HOST}:${WORKER_DIR}"
 ssh "$WORKER_HOST" "mkdir -p $REMOTE_WORKER_DIR"
 scp "$COMPOSE_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/docker-compose.dspark.yml"
 scp "$ENV_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/.env.dspark"
 
-echo "Starting DSpark worker on ${WORKER_HOST}..."
-ssh "$WORKER_HOST" "$REMOTE_COMPOSE NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' ${WORKER_NCCL_IB_GID_INDEX:+NCCL_IB_GID_INDEX=$WORKER_NCCL_IB_GID_INDEX} docker compose --env-file .env.dspark -f docker-compose.dspark.yml up -d"
+echo "Starting DSpark worker on ${WORKER_HOST} (RoCEv2 gid=$WORKER_GID)..."
+ssh "$WORKER_HOST" "$REMOTE_COMPOSE NODE_RANK=1 HEADLESS=1 HF_CACHE='$WORKER_HF_CACHE' VLLM_HOST_IP='$WORKER_VLLM_HOST_IP' ${WORKER_GID:+NCCL_IB_GID_INDEX=$WORKER_GID} docker compose --env-file .env.dspark -f docker-compose.dspark.yml up -d"
 
 echo "Starting DSpark head..."
 COMPOSE_DISABLE_ENV_FILE=1 NODE_RANK=0 HEADLESS= docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d
